@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: truecaller-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python true.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: STRING_SESSION
+        sync: false
+      - key: API_KEY
+        value: felix
+      - key: PORT
+        value: 5000
