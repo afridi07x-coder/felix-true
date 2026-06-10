@@ -654,33 +654,33 @@ def run_async(coro):
     """Run async function from sync Flask context."""
     return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=15)
 
-async def _get_entity_info(ac, target):
-    """Get entity info + public phone from userbot"""
-    entity = await ac.get_entity(target)
+async def _parse_user(entity, fallback_id=None):
+    """Parse any user/entity into info dict"""
     name = " ".join(filter(None, [
         getattr(entity, 'first_name', '') or '',
         getattr(entity, 'last_name', '')  or ''
-    ])).strip() or getattr(entity, 'title', '') or str(target)
-    uname  = getattr(entity, 'username', None)
-    tg_id  = str(entity.id)
-    # Public phone visible on profile
-    phone  = getattr(entity, 'phone', None)
+    ])).strip() or getattr(entity, 'title', '') or (f"User {fallback_id}" if fallback_id else "Unknown")
+    uname = getattr(entity, 'username', None)
+    tg_id = str(entity.id)
+    phone = getattr(entity, 'phone', None)
     return {
-        "name":        name,
-        "username":    f"@{uname}" if uname else None,
-        "telegram_id": tg_id,
+        "name":         name,
+        "username":     f"@{uname}" if uname else None,
+        "telegram_id":  tg_id,
         "public_phone": str(phone) if phone else None
     }
 
 async def resolve_username(username):
     """Resolve username → info dict"""
-    username = username.lstrip('@')
+    uname_clean = username.lstrip('@')
     _, ac = acc_manager.next_client()
     if not ac: return None
     try:
-        info = await _get_entity_info(ac, username)
+        entity = await ac.get_entity(uname_clean)
+        info = await _parse_user(entity, uname_clean)
+        # Ensure username is set even if entity has different username
         if not info["username"]:
-            info["username"] = f"@{username}"
+            info["username"] = f"@{uname_clean}"
         return info
     except Exception as e:
         print(f"[TG] resolve_username failed: {e}")
@@ -690,44 +690,30 @@ async def resolve_userid(user_id):
     """Resolve user_id → info dict"""
     uid = int(user_id)
     _, ac = acc_manager.next_client()
+    if not ac:
+        return {"name": f"User {user_id}", "username": None, "telegram_id": str(uid), "public_phone": None}
 
-    # Try 1: get_entity
+    # Try 1: get_entity (fastest)
     try:
-        info = await _get_entity_info(ac, uid) if ac else None
-        if info:
-            print(f"[TG] get_entity OK: {info['name']} {info['username']}")
-            return info
+        entity = await ac.get_entity(uid)
+        info = await _parse_user(entity, uid)
+        print(f"[TG] get_entity OK: {info['name']} {info['username']}")
+        return info
     except Exception as e:
         print(f"[TG] get_entity failed: {e}")
 
     # Try 2: GetFullUserRequest
     try:
-        result = await ac(GetFullUserRequest(uid)) if ac else None
-        if result:
-            u = result.users[0] if result.users else None
-            if u:
-                name = " ".join(filter(None, [
-                    getattr(u, 'first_name', '') or '',
-                    getattr(u, 'last_name', '') or ''
-                ])).strip() or None
-                uname = getattr(u, 'username', None)
-                phone = getattr(u, 'phone', None)
-                print(f"[TG] GetFullUser OK: {name}")
-                return {
-                    "name":         name or f"User {user_id}",
-                    "username":     f"@{uname}" if uname else None,
-                    "telegram_id":  str(uid),
-                    "public_phone": str(phone) if phone else None
-                }
+        full = await ac(GetFullUserRequest(uid))
+        u = full.users[0] if full and full.users else None
+        if u:
+            info = await _parse_user(u, uid)
+            print(f"[TG] GetFullUser OK: {info['name']} {info['username']}")
+            return info
     except Exception as e:
         print(f"[TG] GetFullUser failed: {e}")
 
-    return {
-        "name":         f"User {user_id}",
-        "username":     None,
-        "telegram_id":  str(uid),
-        "public_phone": None
-    }
+    return {"name": f"User {user_id}", "username": None, "telegram_id": str(uid), "public_phone": None}
 
 def fetch_phone_from_apis(tg_id):
     """Try APIs to get phone. Priority: userid-to-num → felixapi"""
@@ -830,22 +816,34 @@ def tg_lookup():
         else:
             location = {"country": "Unknown", "country_code": "", "phone_number": "Not found"}
 
-    # Step 3: Country code → short flag (IND, PAK, etc.)
-    CC_MAP = {
-        "+91": "IND", "+92": "PAK", "+1": "USA", "+44": "GBR",
-        "+971": "UAE", "+966": "SAU", "+880": "BGD", "+94": "LKA",
-        "+977": "NPL", "+98": "IRN", "+90": "TUR", "+20": "EGY",
-        "+55": "BRA", "+86": "CHN", "+81": "JPN", "+82": "KOR",
-        "+7": "RUS", "+49": "DEU", "+33": "FRA", "+39": "ITA",
-        "+34": "ESP", "+31": "NLD", "+61": "AUS", "+64": "NZL",
-        "+27": "ZAF", "+234": "NGA", "+254": "KEN", "+213": "DZA",
-        "+40": "ROU", "+48": "POL", "+380": "UKR", "+30": "GRC",
-    }
-    cc_raw = location["country_code"]
-    cc_short = CC_MAP.get(cc_raw, cc_raw)
-
-    # Step 4: info_key based on input type
+    # Step 3: info_key based on input type
     info_key = "username_info" if is_username else "userid_info"
+
+    # Step 4: Fix public phone — extract country_code if missing
+    phone_num = location["phone_number"]
+    country_code = location["country_code"]
+    country = location["country"]
+
+    # If public phone and no country_code — try to detect from known prefixes
+    if phone_num and phone_num != "Not found" and not country_code:
+        PHONE_CC = [
+            ("+880", "Bangladesh"), ("+977", "Nepal"), ("+94", "Sri Lanka"),
+            ("+971", "UAE"), ("+966", "Saudi Arabia"), ("+92", "Pakistan"),
+            ("+91", "India"), ("+1", "USA"), ("+44", "UK"),
+            ("+98", "Iran"), ("+90", "Turkey"), ("+7", "Russia"),
+            ("+86", "China"), ("+81", "Japan"), ("+82", "South Korea"),
+            ("+49", "Germany"), ("+33", "France"), ("+39", "Italy"),
+            ("+55", "Brazil"), ("+61", "Australia"), ("+40", "Romania"),
+        ]
+        for cc, cname in PHONE_CC:
+            digits = cc.replace("+", "")
+            if phone_num.startswith(digits):
+                country_code = cc
+                if country == "Unknown":
+                    country = cname
+                # Strip country code prefix from phone number
+                phone_num = phone_num[len(digits):]
+                break
 
     # Step 5: Build response
     result = {
@@ -855,9 +853,9 @@ def tg_lookup():
             "telegram_id": tg_id
         },
         "location": {
-            "country":      location["country"],
-            "country_code": cc_short,
-            "phone_number": location["phone_number"]
+            "country":      country,
+            "country_code": country_code,
+            "phone_number": phone_num
         },
         "made_by": "@Felix_Bhai"
     }
